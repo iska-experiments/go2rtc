@@ -150,7 +150,9 @@ func ParsePacketHeader(data []byte) *PacketHeader {
 		hdr.PayloadSize = binary.LittleEndian.Uint16(data[16:])
 		hdr.FrameNo = binary.LittleEndian.Uint32(data[24:])
 
-		if pktIdxOrMarker == 0x0028 && (IsEndFrame(frameType) || hdr.PktTotal == 1) {
+		// 0x28 marks the packet carrying FRAMEINFO (the frame's last). Some firmware sends it on
+		// start-type packets too; it can only be an index when the frame has more packets.
+		if pktIdxOrMarker == 0x0028 && (IsEndFrame(frameType) || hdr.PktTotal == 1 || hdr.PktTotal <= 0x0028) {
 			hdr.HasFrameInfo = true
 			if hdr.PktTotal > 0 {
 				hdr.PktIdx = hdr.PktTotal - 1
@@ -164,7 +166,7 @@ func ParsePacketHeader(data []byte) *PacketHeader {
 		hdr.PayloadSize = binary.LittleEndian.Uint16(data[24:])
 		hdr.FrameNo = binary.LittleEndian.Uint32(data[32:])
 
-		if pktIdxOrMarker == 0x0028 && (IsEndFrame(frameType) || hdr.PktTotal == 1) {
+		if pktIdxOrMarker == 0x0028 && (IsEndFrame(frameType) || hdr.PktTotal == 1 || hdr.PktTotal <= 0x0028) {
 			hdr.HasFrameInfo = true
 			if hdr.PktTotal > 0 {
 				hdr.PktIdx = hdr.PktTotal - 1
@@ -242,6 +244,10 @@ func (t *tsTracker) update(rawTS uint32) uint64 {
 
 type FrameHandler struct {
 	channels map[byte]*channelState
+	// A video frame was lost (or none has arrived yet): drop frames until the next keyframe.
+	// Frames that follow a lost keyframe belong to a GOP whose start the reader never saw, and
+	// their picture order then jumps backwards, which RTSP/HLS consumers (MediaMTX) reject.
+	videoGap bool
 	videoTS  tsTracker
 	audioTS  tsTracker
 	output   chan *Packet
@@ -253,6 +259,7 @@ type FrameHandler struct {
 func NewFrameHandler(verbose bool) *FrameHandler {
 	return &FrameHandler{
 		channels: make(map[byte]*channelState),
+		videoGap: true,
 		output:   make(chan *Packet, 128),
 		verbose:  verbose,
 	}
@@ -378,6 +385,7 @@ func (h *FrameHandler) handleVideo(channel byte, hdr *PacketHeader, payload []by
 		if cs.hasStarted && cs.waitSeq < cs.pktTotal {
 			fmt.Printf("[DROP] ch=0x%02x #%d INCOMPLETE: got %d/%d pkts\n",
 				channel, cs.frameNo, cs.waitSeq, cs.pktTotal)
+			h.videoGap = true
 		}
 		cs.reset()
 		cs.frameNo = hdr.FrameNo
@@ -389,6 +397,7 @@ func (h *FrameHandler) handleVideo(channel byte, hdr *PacketHeader, payload []by
 		fmt.Printf("[OOO] ch=0x%02x #%d frameType=0x%02x pktTotal=%d expected pkt %d, got %d - reset\n",
 			channel, hdr.FrameNo, hdr.FrameType, hdr.PktTotal, cs.waitSeq, hdr.PktIdx)
 		cs.reset()
+		h.videoGap = true
 		return
 	}
 
@@ -416,6 +425,7 @@ func (h *FrameHandler) handleVideo(channel byte, hdr *PacketHeader, payload []by
 	if fi.PayloadSize > 0 && uint32(len(cs.waitData)) != fi.PayloadSize {
 		fmt.Printf("[SIZE] ch=0x%02x #%d mismatch: expected %d, got %d\n",
 			channel, cs.frameNo, fi.PayloadSize, len(cs.waitData))
+		h.videoGap = true
 		return
 	}
 
@@ -423,7 +433,16 @@ func (h *FrameHandler) handleVideo(channel byte, hdr *PacketHeader, payload []by
 		return
 	}
 
+	// Every complete frame advances the clock, also the ones dropped below: the camera's timestamp
+	// wraps each second, so skipping more than a second of frames would lose whole seconds.
 	accumUS := h.videoTS.update(fi.Timestamp)
+
+	if h.videoGap {
+		if !fi.IsKeyframe() {
+			return
+		}
+		h.videoGap = false
+	}
 	rtpTS := uint32(accumUS * 90000 / 1000000)
 
 	pkt := &Packet{
