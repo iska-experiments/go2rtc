@@ -21,6 +21,7 @@
 package hksv
 
 import (
+	"bufio"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,9 +30,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -125,6 +128,8 @@ type Server struct {
 	pairings []string
 	conns    []any
 	mu       sync.Mutex
+
+	failedPairSetups atomic.Int32
 
 	accessory *hap.Accessory
 	setupID   string
@@ -288,8 +293,16 @@ func (s *Server) Handle(w http.ResponseWriter, r *http.Request) {
 
 	switch r.RequestURI {
 	case hap.PathPairSetup:
+		// Pair-setup is only for an unpaired accessory, and the 8-digit code must not be brute
+		// forced (HAP: kTLVError_Unavailable once paired, kTLVError_MaxTries after 100 failures).
+		if code := s.pairSetupRefusal(); code != 0 {
+			s.log.Warn().Str("stream", s.stream).Msgf("[hksv] %s: refused pair-setup (error %d)", conn.RemoteAddr(), code)
+			_ = writePairSetupError(rw, code)
+			return
+		}
 		id, key, err := s.hap.PairSetup(r, rw)
 		if err != nil {
+			s.failedPairSetups.Add(1)
 			s.log.Error().Err(err).Caller().Send()
 			return
 		}
@@ -541,7 +554,7 @@ func (s *Server) SetCharacteristic(conn net.Conn, aid uint8, iid uint64, value a
 		accessoryKeySalt := core.RandString(32, 0)
 		combinedSalt := req.ControllerKeySalt + accessoryKeySalt
 
-		ln, err := net.ListenTCP("tcp", nil)
+		ln, err := listenHDS()
 		if err != nil {
 			s.log.Error().Err(err).Str("stream", s.stream).Msg("[hksv] listen failed")
 			return
@@ -817,4 +830,52 @@ func isClosedConnErr(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "use of closed network connection")
+}
+
+// listenHDS opens the HomeKit Data Stream listener. GO2RTC_HDS_PORTS ("first-last") pins it to a
+// range a host firewall can allow; without it any free port is used, as upstream does.
+func listenHDS() (*net.TCPListener, error) {
+	var first, last int
+	if _, err := fmt.Sscanf(os.Getenv("GO2RTC_HDS_PORTS"), "%d-%d", &first, &last); err != nil {
+		return net.ListenTCP("tcp", nil)
+	}
+	var err error
+	for port := first; port <= last; port++ {
+		var ln *net.TCPListener
+		if ln, err = net.ListenTCP("tcp", &net.TCPAddr{Port: port}); err == nil {
+			return ln, nil
+		}
+	}
+	return nil, fmt.Errorf("no free HDS port in %d-%d: %w", first, last, err)
+}
+
+const (
+	pairSetupMaxTries   = 100
+	tlvErrorMaxTries    = 5
+	tlvErrorUnavailable = 6
+)
+
+func (s *Server) pairSetupRefusal() byte {
+	s.mu.Lock()
+	paired := len(s.pairings) > 0
+	s.mu.Unlock()
+	switch {
+	case paired:
+		return tlvErrorUnavailable
+	case s.failedPairSetups.Load() >= pairSetupMaxTries:
+		return tlvErrorMaxTries
+	}
+	return 0
+}
+
+// writePairSetupError answers pair-setup M1 with M2 carrying a TLV error.
+func writePairSetupError(rw *bufio.ReadWriter, code byte) error {
+	body, err := tlv8.Marshal(struct {
+		State byte `tlv8:"6"`
+		Error byte `tlv8:"7"`
+	}{State: hap.StateM2, Error: code})
+	if err != nil {
+		return err
+	}
+	return hap.WriteResponse(rw.Writer, http.StatusOK, hap.MimeTLV8, body)
 }
