@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -78,6 +79,8 @@ type DTLSConn struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	mu      sync.RWMutex
+	// Read deadline for AVRecvFrameData; reader() resets the socket's own every 100 ms.
+	deadline time.Time
 
 	// DTLS
 	clientConn *dtls.Conn
@@ -313,6 +316,15 @@ func (c *DTLSConn) AVServStop() error {
 }
 
 func (c *DTLSConn) AVRecvFrameData() (*tutk.Packet, error) {
+	c.mu.RLock()
+	deadline := c.deadline
+	c.mu.RUnlock()
+	var expired <-chan time.Time
+	if !deadline.IsZero() {
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		expired = timer.C
+	}
 	select {
 	case pkt, ok := <-c.frames.Recv():
 		if !ok {
@@ -321,6 +333,9 @@ func (c *DTLSConn) AVRecvFrameData() (*tutk.Packet, error) {
 		return pkt, nil
 	case <-c.ctx.Done():
 		return nil, c.Error()
+	case <-expired:
+		// The camera went quiet (rebooted, or the P2P session died) while keepalives still pass.
+		return nil, os.ErrDeadlineExceeded
 	}
 }
 
@@ -464,6 +479,9 @@ func (c *DTLSConn) LocalAddr() *net.UDPAddr {
 }
 
 func (c *DTLSConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
 	return c.conn.SetDeadline(t)
 }
 
