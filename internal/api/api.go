@@ -175,6 +175,18 @@ func HandleFunc(pattern string, handler http.HandlerFunc) {
 		return
 	}
 	log.Trace().Str("path", pattern).Msg("[api] register path")
+	if strings.HasPrefix(pattern, basePath+"/api/") {
+		// The API (config, streams, restart, motion) is for this host only; HomeKit pairing
+		// (/pair-setup, /pair-verify) stays reachable from the LAN.
+		inner := handler
+		handler = func(w http.ResponseWriter, r *http.Request) {
+			if !isLoopback(r.RemoteAddr) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			inner(w, r)
+		}
+	}
 	http.HandleFunc(pattern, handler)
 }
 
